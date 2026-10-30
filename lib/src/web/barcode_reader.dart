@@ -7,7 +7,12 @@ import 'package:mobile_scanner/src/enums/torch_state.dart';
 import 'package:mobile_scanner/src/mobile_scanner_exception.dart';
 import 'package:mobile_scanner/src/objects/barcode_capture.dart';
 import 'package:mobile_scanner/src/objects/start_options.dart';
+import 'package:mobile_scanner/src/web/media_track_extension.dart';
 import 'package:web/web.dart';
+
+const String _torchUnsupportedMessage =
+    'Setting the torch state is not supported for video tracks on the web.\n'
+    'See https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints#instance_properties_of_video_tracks';
 
 /// This class represents the base interface for a barcode reader
 /// implementation.
@@ -66,11 +71,45 @@ abstract class BarcodeReader {
     throw UnimplementedError('detectBarcodes() has not been implemented.');
   }
 
-  /// Check whether the active camera has a flashlight.
-  Future<bool> hasTorch() {
-    // The torch of a media stream is not available for video tracks.
-    // See https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints#instance_properties_of_video_tracks
-    return Future<bool>.value(false);
+  /// Whether the active camera can turn its torch on.
+  ///
+  /// Reads `MediaTrackCapabilities.torch` with [readTorchCapability], so a
+  /// browser that reports a boolean and a browser that reports
+  /// `sequence<boolean>` are both accepted.
+  ///
+  /// Returns false when the track does not expose capabilities, for example
+  /// on Firefox.
+  Future<bool> hasTorch() async {
+    try {
+      final track = _activeVideoTrack();
+
+      if (track == null) {
+        return false;
+      }
+
+      return track.getCapabilities().canEnableTorch;
+    } on Object {
+      // Firefox does not support getCapabilities() yet.
+      // https://developer.mozilla.org/en-US/docs/Web/API/MediaStreamTrack/getCapabilities#browser_compatibility
+      return false;
+    }
+  }
+
+  /// The first video track of [videoStream], if there is one.
+  MediaStreamTrack? _activeVideoTrack() {
+    final stream = videoStream;
+
+    if (stream == null) {
+      return null;
+    }
+
+    final tracks = stream.getVideoTracks().toDart;
+
+    if (tracks.isEmpty) {
+      return null;
+    }
+
+    return tracks.first;
   }
 
   /// Load the barcode reader library.
@@ -137,11 +176,27 @@ abstract class BarcodeReader {
   }
 
   /// Set the torch state for the active camera to the given [value].
-  Future<void> setTorchState(TorchState value) {
-    throw UnsupportedError(
-      'Setting the torch state is not supported for video tracks on the web.\n'
-      'See https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints#instance_properties_of_video_tracks',
-    );
+  ///
+  /// Applies a boolean torch constraint. Whether the camera can turn the torch
+  /// on is decided by [hasTorch], which accepts both shapes of the capability.
+  ///
+  /// Throws [UnsupportedError] when the camera cannot enable its torch.
+  Future<void> setTorchState(TorchState value) async {
+    final track = _activeVideoTrack();
+
+    if (track == null) {
+      throw UnsupportedError(_torchUnsupportedMessage);
+    }
+
+    final enabled = value == TorchState.on;
+
+    if (enabled && !track.getCapabilities().canEnableTorch) {
+      throw UnsupportedError(_torchUnsupportedMessage);
+    }
+
+    await track
+        .applyConstraints(MediaTrackConstraints(torch: enabled.toJS))
+        .toDart;
   }
 
   /// Start the barcode reader and initialize the [videoStream].

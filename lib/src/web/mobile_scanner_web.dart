@@ -69,6 +69,18 @@ class MobileScannerWeb extends MobileScannerPlatform {
   final MediaTrackConstraintsDelegate _settingsDelegate =
       const MediaTrackConstraintsDelegate();
 
+  /// The torch state of the active camera.
+  ///
+  /// Stays [TorchState.unavailable] until a started camera reports that its
+  /// torch can be enabled.
+  TorchState _torchState = TorchState.unavailable;
+
+  /// Emits changes of [_torchState] after the camera has started.
+  ///
+  /// Not closed, as this has the same lifetime as the plugin.
+  final StreamController<TorchState> _torchStateController =
+      StreamController<TorchState>.broadcast();
+
   /// The texture ID for the camera view.
   int _textureId = 1;
 
@@ -94,8 +106,7 @@ class MobileScannerWeb extends MobileScannerPlatform {
   Stream<BarcodeCapture?> get barcodesStream => _barcodesController.stream;
 
   @override
-  Stream<TorchState> get torchStateStream =>
-      _settingsController.stream.map((_) => TorchState.unavailable);
+  Stream<TorchState> get torchStateStream => _torchStateController.stream;
 
   @override
   Stream<double> get zoomScaleStateStream =>
@@ -441,9 +452,7 @@ class MobileScannerWeb extends MobileScannerPlatform {
 
         return MobileScannerViewAttributes(
           cameraDirection: cameraDirection,
-          // The torch of a media stream is not available for video tracks.
-          // See https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints#instance_properties_of_video_tracks
-          currentTorchMode: TorchState.unavailable,
+          currentTorchMode: _torchState,
           size: _barcodeReader?.videoSize ?? Size.zero,
         );
       }
@@ -552,18 +561,17 @@ class MobileScannerWeb extends MobileScannerPlatform {
       );
 
       final hasTorch = await _barcodeReader?.hasTorch() ?? false;
-
-      if (hasTorch && startOptions.torchEnabled) {
-        await _barcodeReader?.setTorchState(TorchState.on);
-      }
+      final torchState = await _resolveTorchState(
+        hasTorch: hasTorch,
+        torchEnabled: startOptions.torchEnabled,
+      );
+      _emitTorchState(torchState);
 
       final cameraDirection = _settingsDelegate.getCameraDirection(videoStream);
 
       return MobileScannerViewAttributes(
         cameraDirection: cameraDirection,
-        // The torch of a media stream is not available for video tracks.
-        // See https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints#instance_properties_of_video_tracks
-        currentTorchMode: TorchState.unavailable,
+        currentTorchMode: torchState,
         size: _barcodeReader?.videoSize ?? Size.zero,
       );
     } catch (error, stackTrace) {
@@ -592,14 +600,23 @@ class MobileScannerWeb extends MobileScannerPlatform {
     await _barcodeReader?.stop();
     _barcodeReader = null;
     _activeWebReader = null;
+    _torchState = TorchState.unavailable;
   }
 
   @override
-  Future<void> toggleTorch() {
-    throw UnsupportedError(
-      'Setting the torch state is not supported for video tracks on the web.\n'
-      'See https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints#instance_properties_of_video_tracks',
-    );
+  Future<void> toggleTorch() async {
+    if (_torchState == TorchState.unavailable || _barcodeReader == null) {
+      throw UnsupportedError(
+        'Setting the torch state is not supported for video tracks on the '
+        'web.\n'
+        'See https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints#instance_properties_of_video_tracks',
+      );
+    }
+
+    final next = _torchState == TorchState.on ? TorchState.off : TorchState.on;
+
+    await _barcodeReader?.setTorchState(next);
+    _emitTorchState(next);
   }
 
   @override
@@ -610,10 +627,44 @@ class MobileScannerWeb extends MobileScannerPlatform {
     return Future<void>.value();
   }
 
+  /// Turns the torch on when [torchEnabled] is set and the camera supports it.
+  ///
+  /// A failure to apply the constraint does not fail camera start; the torch
+  /// stays off and scanning continues.
+  Future<TorchState> _resolveTorchState({
+    required bool hasTorch,
+    required bool torchEnabled,
+  }) async {
+    if (!hasTorch) {
+      return TorchState.unavailable;
+    }
+
+    if (!torchEnabled) {
+      return TorchState.off;
+    }
+
+    try {
+      await _barcodeReader?.setTorchState(TorchState.on);
+    } on Object {
+      return TorchState.off;
+    }
+
+    return TorchState.on;
+  }
+
+  void _emitTorchState(TorchState torchState) {
+    _torchState = torchState;
+
+    if (!_torchStateController.isClosed) {
+      _torchStateController.add(torchState);
+    }
+  }
+
   @override
   Future<void> dispose() async {
-    // The `_barcodesController` and `_settingsController`
-    // are not closed, as these have the same lifetime as the plugin.
+    // The `_barcodesController`, `_settingsController`, and
+    // `_torchStateController` are not closed, as these have the same lifetime
+    // as the plugin.
     await stop();
   }
 }
